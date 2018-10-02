@@ -38,6 +38,9 @@
 
 #include <costmap_prohibition_layer/costmap_prohibition_layer.h>
 #include <pluginlib/class_list_macros.h>
+/*#include <costmap_prohibition_layer/ClearProhibitedPoints.h>
+#include <costmap_prohibition_layer/GetProhibitedPoints.h>
+#include <costmap_prohibition_layer/SetProhibitedPoints.h>*/
 
 PLUGINLIB_EXPORT_CLASS(costmap_prohibition_layer_namespace::CostmapProhibitionLayer, costmap_2d::Layer)
 
@@ -46,22 +49,36 @@ using costmap_2d::LETHAL_OBSTACLE;
 namespace costmap_prohibition_layer_namespace
 {
     
-CostmapProhibitionLayer::CostmapProhibitionLayer() : _dsrv(NULL)
+CostmapProhibitionLayer::CostmapProhibitionLayer() : _dsrv(NULL) , _nh(NULL)
 {
+	_update=false;
+	_empty = true;
+	_prohibition_polygons_update = std::vector<std::vector<geometry_msgs::Point>>();
+	_times_draw_zones = -1;
+	_polygons_cleaners = -1;
 }
 
 CostmapProhibitionLayer::~CostmapProhibitionLayer()
 {
-    if (_dsrv!=NULL)
+	if (_dsrv!=NULL)
         delete _dsrv;
+    if (_nh != NULL)
+		delete _nh;
 }
 
 void CostmapProhibitionLayer::onInitialize()
 {
-  ros::NodeHandle nh("~/" + name_);
+  _nh = new ros::NodeHandle ("~/" + name_);
   current_ = true;
+  
+  _service_clear = _nh->advertiseService("clear", &CostmapProhibitionLayer::clearProhibitionsPointsService, this);
+  _service_get = _nh->advertiseService("get", &CostmapProhibitionLayer::getProhibitionsPointsService, this);
+  _service_set = _nh->advertiseService("set", &CostmapProhibitionLayer::setProhibitionsPointsService, this);
+  _service_add_polygon = _nh->advertiseService("addPolygon", &CostmapProhibitionLayer::addPolygonProhibitionsPointsService, this);
+  
+  
 
-  _dsrv = new dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>(nh);
+  _dsrv = new dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>(*_nh);
   dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>::CallbackType cb =
       boost::bind(&CostmapProhibitionLayer::reconfigureCB, this, _1, _2);
   _dsrv->setCallback(cb);
@@ -76,16 +93,28 @@ void CostmapProhibitionLayer::onInitialize()
   // reading the prohibition areas out of the namespace of this plugin!
   // e.g.: "move_base/global_costmap/prohibition_layer/prohibition_areas"
   std::string params = "prohibition_areas";
-  if (!parseProhibitionListFromYaml(&nh, params))
-    ROS_ERROR_STREAM("Reading prohibition areas from '" << nh.getNamespace() << "/" << params << "' failed!");
-  
+  if (!parseProhibitionListFromYaml(_nh, params)){
+    ROS_INFO_STREAM("Reading prohibition areas from '" << _nh->getNamespace() << "/" << params << "' failed!");
+    std::vector<geometry_msgs::Point> arrayPoints;
+    for(int cont_points = 0; cont_points < 3; cont_points++){
+		geometry_msgs::Point aux_point;
+		aux_point.x = 0;
+		aux_point.y = 0;
+		aux_point.z = 0;
+		arrayPoints.push_back(aux_point);
+		_empty = true;
+	}
+	_prohibition_polygons.push_back(arrayPoints);
+  }
+  _prohibition_polygons_update = _prohibition_polygons;
   _fill_polygons = true;
-  nh.param("fill_polygons", _fill_polygons, _fill_polygons);
+  _nh->param("fill_polygons", _fill_polygons, _fill_polygons);
   
   // compute map bounds for the current set of prohibition areas.
   computeMapBounds();
-  
+
   ROS_INFO("CostmapProhibitionLayer initialized.");
+  
 }
 
 void CostmapProhibitionLayer::reconfigureCB(CostmapProhibitionLayerConfig &config, uint32_t level)
@@ -171,35 +200,93 @@ void CostmapProhibitionLayer::computeMapBounds()
   }
 }
 
+void CostmapProhibitionLayer::computeMapBoundsUpdate()
+{
+  std::lock_guard<std::mutex> l(_data_mutex);
+    
+  // reset bounds
+  _min_x_update = _min_y_update = _max_x_update = _max_y_update = 0;
+    
+  // iterate polygons
+  for (int i = 0; i < _prohibition_polygons_update.size(); ++i)
+  {
+    for (int j=0; j < _prohibition_polygons_update.at(i).size(); ++j)
+    {
+      double px = _prohibition_polygons_update.at(i).at(j).x;
+      double py = _prohibition_polygons_update.at(i).at(j).y;
+      _min_x_update = std::min(px, _min_x_update);
+      _min_y_update = std::min(py, _min_y_update);
+      _max_x_update = std::max(px, _max_x_update);
+      _max_y_update = std::max(py, _max_y_update);
+    }
+  }
+
+  // iterate points
+  for (int i = 0; i < _prohibition_points.size(); ++i)
+  {
+      double px = _prohibition_points.at(i).x;
+      double py = _prohibition_points.at(i).y;
+      _min_x_update = std::min(px, _min_x_update);
+      _min_y_update = std::min(py, _min_y_update);
+      _max_x_update = std::max(px, _max_x_update);
+      _max_y_update = std::max(py, _max_y_update);
+  }
+}
+
 
 void CostmapProhibitionLayer::setPolygonCost(costmap_2d::Costmap2D &master_grid, const std::vector<geometry_msgs::Point>& polygon, unsigned char cost,
                                              int min_i, int min_j, int max_i, int max_j, bool fill_polygon)
 {
-    std::vector<PointInt> map_polygon;
-    for (unsigned int i = 0; i < polygon.size(); ++i)
-    {
-        PointInt loc;
-        master_grid.worldToMapNoBounds(polygon[i].x, polygon[i].y, loc.x, loc.y);
-        map_polygon.push_back(loc);
-    }
-
-    std::vector<PointInt> polygon_cells;
-
-    // get the cells that fill the polygon
-    rasterizePolygon(map_polygon, polygon_cells, fill_polygon);
-
-    // set the cost of those cells
-    for (unsigned int i = 0; i < polygon_cells.size(); ++i)
-    {
-        int mx = polygon_cells[i].x;
-        int my = polygon_cells[i].y;
-        // check if point is outside bounds
-        if (mx < min_i || mx >= max_i)
-            continue;
-        if (my < min_j || my >= max_j)
-            continue;
-        master_grid.setCost(mx, my, cost);
-    }
+		std::vector<PointInt> map_polygon;
+		std::vector<PointInt> polygon_cells;
+		int points=0;
+		//Get how many poinsta has the polygons
+		for (int cont=0; cont < _prohibition_polygons.size(); cont++){
+			points=points+_prohibition_polygons.at(cont).size();
+		}
+		//Get the index of polygons
+		_times_draw_zones = (_times_draw_zones+1)%points;
+		
+		for (unsigned int i = 0; i < polygon.size(); ++i)
+		{
+			PointInt loc;
+			master_grid.worldToMapNoBounds(polygon[i].x, polygon[i].y, loc.x, loc.y);
+			map_polygon.push_back(loc);
+		}
+		// get the cells that fill the polygon
+		rasterizePolygon(map_polygon, polygon_cells, fill_polygon);
+		// set the cost of those cells
+		for (unsigned int i = 0; i < polygon_cells.size(); ++i)
+		{
+			int mx = polygon_cells[i].x;
+			int my = polygon_cells[i].y;
+			// check if point is outside bounds
+			if (mx < min_i || mx >= max_i)
+				continue;
+			if (my < min_j || my >= max_j)
+				continue;
+			if(_update || _empty){
+				master_grid.setCost(mx, my, 0);
+				_polygons_cleaners=(_polygons_cleaners+1)%(points*1000);
+			}else{
+				master_grid.setCost(mx, my, cost);
+			}
+		}
+		if(_update){
+			bool last_elem_insert = false;
+			if(_times_draw_zones==points-1 && _polygons_cleaners>points){
+				_prohibition_polygons = _prohibition_polygons_update;
+				_min_x = _min_x_update;
+				_min_y = _min_y_update;
+				_max_x = _max_x_update;
+				_max_y = _max_y_update;
+				_times_draw_zones = -1;
+				_update = false;
+				ROS_WARN("CostmapProhibitionLayer::setPolygonCost - Update costmap prohibition layer");
+			}else{
+				return;
+			}
+		}
 }
 
 
@@ -326,7 +413,7 @@ void CostmapProhibitionLayer::rasterizePolygon(const std::vector<PointInt>& poly
   }
 
 // load prohibition positions out of the rosparam server
-bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhandle, const std::string &param)
+bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *_nhandle, const std::string &param)
 {
   std::lock_guard<std::mutex> l(_data_mutex);
   std::unordered_map<std::string, geometry_msgs::Pose> map_out;
@@ -335,7 +422,7 @@ bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhan
 
   bool ret_val = true;
 
-  if (nhandle->getParam(param, param_yaml))
+  if (_nhandle->getParam(param, param_yaml))
   {
     if (param_yaml.getType() == XmlRpc::XmlRpcValue::TypeArray)  // list of goals
     {
@@ -429,11 +516,32 @@ bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhan
       ROS_ERROR_STREAM("Prohibition Layer: " << param << "struct is not correct.");
       ret_val = false;
     }
+	  
   }
   else
   {
     ROS_ERROR_STREAM("Prohibition Layer: Cannot read " << param << " from parameter server");
     ret_val = false;
+  }
+  if (_nhandle->getParam("prohibition_areas_empty_to_start", param_yaml))
+  {
+	  if (param_yaml.getType() == XmlRpc::XmlRpcValue::TypeBoolean){
+		  if(!param_yaml){
+			  _update=false;
+			  _empty=false;
+		  }else{
+			  _update=false;
+			  _empty = true;
+	      }
+	  }else{
+		  ROS_WARN_STREAM("Prohibition Layer: prohibition_areas_empty_to_start is not a boolean, default: false." << param_yaml.getType());
+		  _update=false;
+		  _empty = true;
+	  }	
+  }else{
+	  ROS_WARN_STREAM("Prohibition Layer: prohibition_areas_empty_to_start is not exist, default: false.");
+	  _update=false;
+	  _empty = true;
   }
   return ret_val;
 }
@@ -471,4 +579,85 @@ bool CostmapProhibitionLayer::getPoint(XmlRpc::XmlRpcValue &val, geometry_msgs::
   }
 }
 
-}  // end namespace
+bool CostmapProhibitionLayer::getProhibitionsPointsService (costmap_prohibition_layer::GetProhibitedPoints::Request  &req,
+															costmap_prohibition_layer::GetProhibitedPoints::Response &res){
+																
+	if(_empty){
+		return true;
+	}
+	for(int cont_polygons= 0; cont_polygons < _prohibition_polygons.size(); cont_polygons++){
+		geometry_msgs::Polygon aux_polygon;
+		for (int cont_points=0; cont_points < _prohibition_polygons.at(cont_polygons).size(); cont_points++){
+			geometry_msgs::Point32 aux_point;
+			aux_point.x = _prohibition_polygons.at(cont_polygons).at(cont_points).x;
+			aux_point.y = _prohibition_polygons.at(cont_polygons).at(cont_points).y;
+			aux_point.z = _prohibition_polygons.at(cont_polygons).at(cont_points).z;
+			aux_polygon.points.push_back(aux_point);
+		}
+		res.polygons.push_back(aux_polygon);
+	}
+	
+	
+	return true;
+}
+
+bool CostmapProhibitionLayer::setProhibitionsPointsService (costmap_prohibition_layer::SetProhibitedPoints::Request  &req,
+															costmap_prohibition_layer::SetProhibitedPoints::Response &res){
+	_prohibition_polygons_update = std::vector<std::vector<geometry_msgs::Point>>();
+	
+	
+	for(int cont_polygons = 0; cont_polygons < req.polygons.size(); cont_polygons++){
+		std::vector<geometry_msgs::Point> arrayPoints;
+		for(int cont_points = 0; cont_points < req.polygons.at(cont_polygons).points.size(); cont_points++){
+			geometry_msgs::Point aux_point;
+			aux_point.x = req.polygons.at(cont_polygons).points.at(cont_points).x;
+			aux_point.y = req.polygons.at(cont_polygons).points.at(cont_points).y;
+			aux_point.z = req.polygons.at(cont_polygons).points.at(cont_points).z;
+			arrayPoints.push_back(aux_point);
+		}
+		_prohibition_polygons_update.push_back(arrayPoints);
+	}
+	
+	computeMapBoundsUpdate();
+	_update = true;
+	_empty = false;
+	_polygons_cleaners = -1;
+	res.msg = "Ok - " + std::to_string(_prohibition_polygons_update.size());
+	return true;
+}
+
+
+bool CostmapProhibitionLayer::addPolygonProhibitionsPointsService (costmap_prohibition_layer::AddProhibitedPoints::Request  &req,
+															costmap_prohibition_layer::AddProhibitedPoints::Response &res){
+	
+	std::vector<geometry_msgs::Point> arrayPoints;
+	for(int cont_points = 0; cont_points < req.polygons.points.size(); cont_points++){
+		geometry_msgs::Point aux_point;
+		aux_point.x = req.polygons.points.at(cont_points).x;
+		aux_point.y = req.polygons.points.at(cont_points).y;
+		aux_point.z = req.polygons.points.at(cont_points).z;
+		arrayPoints.push_back(aux_point);
+	}
+	_prohibition_polygons_update.push_back(arrayPoints);
+	
+	computeMapBoundsUpdate();
+	_update = true;
+	_empty = false;
+	_polygons_cleaners = -1;
+	res.msg = "Ok - " + std::to_string(_prohibition_polygons_update.size()) + " areas";
+	return true;
+}
+
+bool CostmapProhibitionLayer::clearProhibitionsPointsService (costmap_prohibition_layer::ClearProhibitedPoints::Request  &req,
+															costmap_prohibition_layer::ClearProhibitedPoints::Response &res){
+	//_prohibition_polygons_update = std::vector<std::vector<geometry_msgs::Point>>();
+	//computeMapBounds();
+	_update = true;
+	_empty = true;
+	_polygons_cleaners = -1;
+	res.msg = "Ok - 0 areas";
+	return true;
+}
+
+}
+// end namespace

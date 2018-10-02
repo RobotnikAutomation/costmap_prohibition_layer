@@ -43,12 +43,18 @@
 #include <tf/transform_datatypes.h>
 #include <mutex>
 #include <geometry_msgs/PoseArray.h>
+#include <geometry_msgs/Polygon.h>
 #include <stdlib.h>
 #include <ros/ros.h>
 #include <costmap_2d/layer.h>
 #include <costmap_2d/layered_costmap.h>
 #include <costmap_prohibition_layer/CostmapProhibitionLayerConfig.h>
 #include <dynamic_reconfigure/server.h>
+
+#include <costmap_prohibition_layer/GetProhibitedPoints.h>
+#include <costmap_prohibition_layer/SetProhibitedPoints.h>
+#include <costmap_prohibition_layer/ClearProhibitedPoints.h>
+#include <costmap_prohibition_layer/AddProhibitedPoints.h>
 
 #include <unordered_map>
 
@@ -97,6 +103,8 @@ public:
    */
   virtual void updateCosts(costmap_2d::Costmap2D& master_grid, int min_i, int min_j,
                            int max_i, int max_j);
+                           
+
 
 private:
     
@@ -192,7 +200,15 @@ private:
  *                    false if it wasn't
   */
   bool getPoint(XmlRpc::XmlRpcValue& val, geometry_msgs::Point& point);
+  
+  bool getProhibitionsPointsService (costmap_prohibition_layer::GetProhibitedPoints::Request  &req, costmap_prohibition_layer::GetProhibitedPoints::Response &res);
+  bool setProhibitionsPointsService (costmap_prohibition_layer::SetProhibitedPoints::Request  &req, costmap_prohibition_layer::SetProhibitedPoints::Response &res);
+  bool clearProhibitionsPointsService (costmap_prohibition_layer::ClearProhibitedPoints::Request  &req, costmap_prohibition_layer::ClearProhibitedPoints::Response &res);
+  bool addPolygonProhibitionsPointsService (costmap_prohibition_layer::AddProhibitedPoints::Request  &req, costmap_prohibition_layer::AddProhibitedPoints::Response &res);
+  void computeMapBoundsUpdate();
 
+
+  ros::NodeHandle* _nh;
   dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>* _dsrv;            //!< dynamic_reconfigure server for the costmap
   std::mutex _data_mutex;                                                       //!< mutex for the accessing _prohibition_points and _prohibition_polygons
   double _costmap_resolution;                                                   //!< resolution of the overlayed costmap to create the thinnest line out of two points
@@ -200,6 +216,16 @@ private:
   std::vector<geometry_msgs::Point> _prohibition_points;                        //!< vector to save the lonely points in source coordinates
   std::vector<std::vector<geometry_msgs::Point>> _prohibition_polygons;         //!< vector to save the polygons (including lines) in source coordinates
   double _min_x, _min_y, _max_x, _max_y;                                        //!< cached map bounds
+  double _min_x_update, _min_y_update, _max_x_update, _max_y_update; 
+  ros::ServiceServer _service_clear;
+  ros::ServiceServer _service_get;
+  ros::ServiceServer _service_set;
+  ros::ServiceServer _service_add_polygon;
+  bool _update;
+  bool _empty;
+  std::vector<std::vector<geometry_msgs::Point>> _prohibition_polygons_update;
+  int _times_draw_zones;
+  int _polygons_cleaners;
 };
 }
 #endif
