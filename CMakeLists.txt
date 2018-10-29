@@ -136,7 +136,7 @@ add_library(costmap_prohibition_layer src/costmap_prohibition_layer.cpp)
 target_link_libraries(costmap_prohibition_layer ${catkin_LIBRARIES})
 
 # Dynamic reconfigure: make sure configure headers are built before any node using them
-add_dependencies(costmap_prohibition_layer ${PROJECT_NAME}_gencfg)
+add_dependencies(costmap_prohibition_layer ${PROJECT_NAME}_gencfg ${PROJECT_NAME}_generate_messages_cpp)
 
 ############
 ## Install ##
